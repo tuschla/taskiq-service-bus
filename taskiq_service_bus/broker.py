@@ -57,11 +57,11 @@ class ServiceBusBroker(AsyncBroker):
         await super().startup()
         self._client = ServiceBusClient.from_connection_string(self._connection_string)
         if self.is_worker_process:
-            lock_renewer = AutoLockRenewer(
+            auto_lock_renewer = AutoLockRenewer(
                 max_lock_renewal_duration=self._max_lock_renewal_duration
             )
             self._receiver = self._client.get_queue_receiver(
-                self._queue_name, lock_renewer=lock_renewer
+                self._queue_name, auto_lock_renewer=auto_lock_renewer
             )
 
         self._sender = self._client.get_queue_sender(self._queue_name)
