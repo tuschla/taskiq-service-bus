@@ -50,7 +50,6 @@ class ServiceBusBroker(AsyncBroker):
 
         self._client: ServiceBusClient | None = None
         self._receiver: ServiceBusReceiver | None = None
-        self._sender: ServiceBusSender | None = None
 
     async def startup(self) -> None:
         """Do something when starting broker."""
@@ -64,7 +63,6 @@ class ServiceBusBroker(AsyncBroker):
                 self._queue_name, auto_lock_renewer=auto_lock_renewer
             )
 
-        self._sender = self._client.get_queue_sender(self._queue_name)
 
     async def shutdown(self) -> None:
         """Close the broker.
@@ -78,7 +76,6 @@ class ServiceBusBroker(AsyncBroker):
             await self._client.close()
 
         self._client = None
-        self._sender = None
         self._receiver = None
 
     async def kick(self, message: BrokerMessage) -> None:
@@ -90,8 +87,6 @@ class ServiceBusBroker(AsyncBroker):
         Returns:
             None
         """
-        if self._sender is None:
-            raise RuntimeError("Sender is not initialized. Call startup() first.")
 
         sb_message = ServiceBusMessage(
             message.message,
@@ -106,12 +101,15 @@ class ServiceBusBroker(AsyncBroker):
         # see: https://taskiq-python.github.io/extending-taskiq/broker.html#conventions
         delay = message.labels.get("delay")
 
-        if delay is not None:
-            delay_seconds = float(delay)
-            scheduled_time = datetime.now(UTC) + timedelta(seconds=delay_seconds)
-            await self._sender.schedule_messages(sb_message, scheduled_time)
-        else:
-            await self._sender.send_messages(sb_message)
+        async with ServiceBusClient.from_connection_string(self._connection_string) as client:
+            async with client.get_queue_sender(self._queue_name) as sender:
+
+                if delay is not None:
+                    delay_seconds = float(delay)
+                    scheduled_time = datetime.now(UTC) + timedelta(seconds=delay_seconds)
+                    await sender.schedule_messages(sb_message, scheduled_time)
+                else:
+                    await sender.send_messages(sb_message)
 
     async def listen(self) -> AsyncGenerator[AckableMessage, None]:
         """Yield messages retrieved from the queue.
