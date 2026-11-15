@@ -36,6 +36,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
     "ruff>=0.15.0",
 ]
 
@@ -84,3 +86,9 @@ lint.select = [
 [tool.ruff.lint.pydocstyle]
 # Use Google-style docstrings.
 convention = "google"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "S101", "SLF001"]
