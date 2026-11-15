@@ -388,3 +388,20 @@ async def test_renewal_uses_the_current_receiver_after_a_replacement(monkeypatch
     assert old.renewed == 0
     assert new.renewed >= 2
     await listen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_receiver_shut_down_while_holding_is_reopened_for_renewal(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.2))
+    receiver = FakeReceiver([b"a", b"b"])
+    broker = make_broker(q=[receiver])
+    listen = broker.listen()
+    (first,) = await take(listen, 1)
+    await asyncio.sleep(0.01)  # "b" is now held, so nothing is receiving
+    receiver.running = False  # the SDK shut the handler down
+    await asyncio.sleep(0.15)
+    assert receiver.running
+    assert receiver.renewed >= 1
+    await first.ack()
+    assert [m.body for m in receiver.completed] == [[b"a"]]
+    await listen.aclose()

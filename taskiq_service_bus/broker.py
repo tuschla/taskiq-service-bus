@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from itertools import chain
@@ -105,6 +105,9 @@ class ServiceBusBroker(AsyncBroker):
         # closed only once its last message has been settled.
         self._unacked: dict[ServiceBusReceiver, int] = {}
         self._replaced: set[ServiceBusReceiver] = set()
+        # Receivers whose reader is holding a message instead of receiving.
+        self._holding: set[ServiceBusReceiver] = set()
+        self._reopen_lock = asyncio.Lock()
 
     async def startup(self) -> None:
         """Do something when starting broker."""
@@ -129,6 +132,7 @@ class ServiceBusBroker(AsyncBroker):
         self._receivers.clear()
         self._unacked.clear()
         self._replaced.clear()
+        self._holding.clear()
 
     async def kick(self, message: BrokerMessage) -> None:
         """Send message to workers.
@@ -260,7 +264,13 @@ class ServiceBusBroker(AsyncBroker):
                     ready_event.set()
                     # Fetch the next message only once this one was handed out, so a
                     # queue never holds more than one message back.
-                    await self._hold(queue_name, receiver, message, margin, ready)
+                    self._holding.add(receiver)
+                    try:
+                        await self._hold(queue_name, receiver, message, margin, ready)
+                    finally:
+                        self._holding.discard(receiver)
+                    async with self._reopen_lock:
+                        pass  # don't receive while a reopen of the receiver runs
                 logger.warning("%s: receiver stopped, retry in %ss", queue_name, delay)
             except Exception:
                 logger.exception("%s: receiver failed, retry in %ss", queue_name, delay)
@@ -317,15 +327,9 @@ class ServiceBusBroker(AsyncBroker):
         """Renew the message lock, retrying until it expires. False if it is lost."""
         while True:
             try:
-                try:
-                    await receiver.renew_message_lock(message)
-                except ValueError:
-                    # The receiver is shut down or reconnecting. Another receiver
-                    # of the same queue can renew the lock by its token.
-                    current = self._receivers.get(queue_name)
-                    if current is None or current is receiver:
-                        raise
-                    await current.renew_message_lock(message)
+                await self._settle_or_renew(
+                    queue_name, receiver, lambda r: r.renew_message_lock(message)
+                )
             except MessageLockLostError:
                 return False
             except Exception:
@@ -345,20 +349,40 @@ class ServiceBusBroker(AsyncBroker):
     ) -> None:
         renewal.cancel()
         try:
-            try:
-                await receiver.complete_message(message)
-            except ValueError:
-                # The receiver was shut down. Another receiver of the same queue can
-                # settle the message by its lock token, if the lock is still valid.
-                current = self._receivers.get(queue_name)
-                if current is None or current is receiver:
-                    raise
-                await current.complete_message(message)
+            await self._settle_or_renew(
+                queue_name, receiver, lambda r: r.complete_message(message)
+            )
         finally:
             if receiver in self._unacked:  # cleared by shutdown()
                 self._unacked[receiver] -= 1
                 if receiver in self._replaced:
                     await self._retire(receiver)
+
+    async def _settle_or_renew(
+        self,
+        queue_name: str,
+        receiver: ServiceBusReceiver,
+        operation: Callable[[ServiceBusReceiver], Awaitable[object]],
+    ) -> None:
+        """Run a lock token operation on the message's receiver.
+
+        If that receiver is shut down (it raises ValueError), run it on the queue's
+        current receiver instead, which can act on any message of the queue by its
+        lock token. If the SDK shut the current receiver down while its reader was
+        holding a message (not receiving, so nothing reopens it), reopen it first,
+        e.g. after a failed management operation.
+        """
+        try:
+            await operation(receiver)
+        except ValueError:
+            current = self._receivers.get(queue_name)
+            holding = current in self._holding
+            if current is None or (current is receiver and not holding):
+                raise  # no other receiver, or its reader is reopening it
+            if holding:
+                async with self._reopen_lock:
+                    await current.__aenter__()  # returns at once if it is open
+            await operation(current)
 
     async def _retire(self, receiver: ServiceBusReceiver) -> None:
         self._replaced.add(receiver)
