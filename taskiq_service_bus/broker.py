@@ -184,6 +184,7 @@ class ServiceBusBroker(AsyncBroker):
                 name = max(available, key=current.__getitem__)
                 current[name] -= sum(self._weights[n] for n in available)
                 receiver, message = ready[name].get_nowait()
+                ready[name].task_done()  # lets that queue's reader fetch the next one
                 yield AckableMessage(
                     data=bytes(chain.from_iterable(message.body)),
                     ack=partial(self._ack, name, receiver, message),
@@ -223,8 +224,11 @@ class ServiceBusBroker(AsyncBroker):
                 async for message in receiver:
                     delay = self._reconnect_delay
                     self._unacked[receiver] += 1
-                    await ready.put((receiver, message))
+                    ready.put_nowait((receiver, message))
                     ready_event.set()
+                    # Fetch the next message only once this one was handed out, so a
+                    # queue never holds more than one message back.
+                    await ready.join()
                 logger.warning("%s: receiver stopped, retry in %ss", queue_name, delay)
             except Exception:
                 logger.exception("%s: receiver failed, retry in %ss", queue_name, delay)

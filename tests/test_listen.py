@@ -26,6 +26,7 @@ class FakeReceiver:
         self.closed = False
         self.completed = []
         self.abandoned = []
+        self.fetched = 0
 
     async def __aenter__(self):
         if self.open_error:
@@ -38,6 +39,7 @@ class FakeReceiver:
 
     async def _iterate(self):
         for message in self.messages:
+            self.fetched += 1
             yield message
         if self.error:
             self.running = False
@@ -271,3 +273,16 @@ async def test_kick_rejects_an_unknown_queue_label():
     )
     with pytest.raises(ValueError, match="other"):
         await broker.kick(message)
+
+
+@pytest.mark.asyncio
+async def test_each_queue_holds_back_at_most_one_message():
+    receiver = FakeReceiver([b"a", b"b", b"c"])
+    broker = make_broker(q=[receiver])
+    listen = broker.listen()
+    await take(listen, 1, pause=0.01)
+    await asyncio.sleep(0.01)
+    # "a" was handed out and "b" waits; "c" must not be received (and locked) yet.
+    assert receiver.fetched == 2
+    await listen.aclose()
+    assert [m.body for m in receiver.abandoned] == [[b"b"]]
