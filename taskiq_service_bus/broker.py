@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 TASK_ID_KEY = "__task_id"
 TASK_NAME_KEY = "__task_name"
 QUEUE_LABEL = "queue"
+# Renew the lock of a held back message this long before it expires.
+HOLD_RENEW_MARGIN = timedelta(seconds=10)
+
+_Ready = tuple[ServiceBusReceiver, ServiceBusReceivedMessage, datetime]
 
 
 class ServiceBusBroker(AsyncBroker):
@@ -150,10 +154,11 @@ class ServiceBusBroker(AsyncBroker):
         """Yield messages retrieved from the queues.
 
         Each queue is read by its own receiver, which holds at most one message
-        until it is yielded. When several queues have a message ready, they are
-        yielded by smooth weighted round-robin, so under load each queue gets its
-        share of the messages, and a queue without messages never delays the
-        others.
+        (renewing its lock) until it is yielded. When several queues have a message
+        ready, they are yielded by smooth weighted round-robin, so under load each
+        queue gets its share of the messages, and a queue without messages never
+        delays the others. The lock renewer takes over a message when it is
+        yielded, so `max_lock_renewal_duration` counts from then.
 
         If a receiver fails or stops (for example after the service closed the
         connection), it is replaced by a new one after a backoff instead of ending
@@ -183,8 +188,16 @@ class ServiceBusBroker(AsyncBroker):
                     current[name] += self._weights[name]
                 name = max(available, key=current.__getitem__)
                 current[name] -= sum(self._weights[n] for n in available)
-                receiver, message = ready[name].get_nowait()
+                receiver, message, received_at = ready[name].get_nowait()
                 ready[name].task_done()  # lets that queue's reader fetch the next one
+                if self._auto_lock_renewer is not None:
+                    # The renewer counts the duration from when the message was
+                    # received; add the time it was held back.
+                    held = (datetime.now(UTC) - received_at).total_seconds()
+                    duration = self._max_lock_renewal_duration + held
+                    self._auto_lock_renewer.register(
+                        receiver, message, max_lock_renewal_duration=duration
+                    )
                 yield AckableMessage(
                     data=bytes(chain.from_iterable(message.body)),
                     ack=partial(self._ack, name, receiver, message),
@@ -196,7 +209,7 @@ class ServiceBusBroker(AsyncBroker):
             # Give back messages that were received but never handed to the worker.
             for queue in ready.values():
                 while not queue.empty():
-                    receiver, message = queue.get_nowait()
+                    receiver, message, _ = queue.get_nowait()
                     try:
                         await receiver.abandon_message(message)
                     except Exception:
@@ -205,16 +218,14 @@ class ServiceBusBroker(AsyncBroker):
     async def _read(
         self,
         queue_name: str,
-        ready: "asyncio.Queue[tuple[ServiceBusReceiver, ServiceBusReceivedMessage]]",
+        ready: "asyncio.Queue[_Ready]",
         ready_event: asyncio.Event,
     ) -> None:
         if self._client is None:
             raise RuntimeError("Broker is not initialized. Call startup() first.")
         delay = self._reconnect_delay
         while True:
-            receiver = self._client.get_queue_receiver(
-                queue_name, auto_lock_renewer=self._auto_lock_renewer
-            )
+            receiver = self._client.get_queue_receiver(queue_name)
             self._receivers[queue_name] = receiver
             self._unacked[receiver] = 0
             try:
@@ -224,17 +235,48 @@ class ServiceBusBroker(AsyncBroker):
                 async for message in receiver:
                     delay = self._reconnect_delay
                     self._unacked[receiver] += 1
-                    ready.put_nowait((receiver, message))
+                    ready.put_nowait((receiver, message, datetime.now(UTC)))
                     ready_event.set()
                     # Fetch the next message only once this one was handed out, so a
                     # queue never holds more than one message back.
-                    await ready.join()
+                    await self._hold(receiver, message, ready)
                 logger.warning("%s: receiver stopped, retry in %ss", queue_name, delay)
             except Exception:
                 logger.exception("%s: receiver failed, retry in %ss", queue_name, delay)
             await self._retire(receiver)
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
+
+    async def _hold(
+        self,
+        receiver: ServiceBusReceiver,
+        message: ServiceBusReceivedMessage,
+        ready: "asyncio.Queue[_Ready]",
+    ) -> None:
+        """Wait until the message is handed out, renewing its lock meanwhile."""
+        if message.locked_until_utc is None:
+            raise RuntimeError("Expected a locked message (PEEK_LOCK receive mode).")
+        lock_duration = message.locked_until_utc - datetime.now(UTC)
+        margin = min(HOLD_RENEW_MARGIN, lock_duration / 2)
+        while True:
+            locked_until = message.locked_until_utc
+            timeout = (locked_until - margin - datetime.now(UTC)).total_seconds()
+            try:
+                await asyncio.wait_for(ready.join(), timeout=max(timeout, 0))
+                return
+            except asyncio.TimeoutError:
+                if ready.empty():
+                    return  # handed out as the timeout fired
+            try:
+                await receiver.renew_message_lock(message)
+            except Exception:
+                if ready.empty():
+                    return  # handed out meanwhile; the lock renewer has it now
+                # Take the message back; it is delivered again once its lock expires.
+                ready.get_nowait()
+                ready.task_done()
+                self._unacked[receiver] -= 1
+                raise
 
     async def _ack(
         self,

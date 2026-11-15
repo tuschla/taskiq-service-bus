@@ -1,5 +1,7 @@
 import asyncio
+import sys
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from azure.servicebus.exceptions import ServiceBusConnectionError
@@ -8,16 +10,21 @@ from taskiq import BrokerMessage
 from taskiq_service_bus import ServiceBusBroker
 from taskiq_service_bus import broker as broker_module
 
+LOCK = timedelta(seconds=60)
+
 
 class FakeMessage:
     def __init__(self, body: bytes) -> None:
         self.body = [body]
+        self.locked_until_utc = datetime.now(UTC) + LOCK
 
 
 class FakeReceiver:
     """Yields its messages, then fails with `error`, stops, or waits forever."""
 
-    def __init__(self, messages=(), *, error=None, open_error=None, stop=False):
+    def __init__(
+        self, messages=(), *, error=None, open_error=None, stop=False, renew_error=None
+    ):
         self.messages = [FakeMessage(m) for m in messages]
         self.error = error
         self.open_error = open_error
@@ -27,6 +34,8 @@ class FakeReceiver:
         self.completed = []
         self.abandoned = []
         self.fetched = 0
+        self.renewed = 0
+        self.renew_error = renew_error
 
     async def __aenter__(self):
         if self.open_error:
@@ -51,6 +60,12 @@ class FakeReceiver:
         if not self.running:
             raise ValueError("handler has already been shutdown")
         self.completed.append(message)
+
+    async def renew_message_lock(self, message) -> None:
+        if self.renew_error:
+            raise self.renew_error
+        self.renewed += 1
+        message.locked_until_utc = datetime.now(UTC) + LOCK
 
     async def abandon_message(self, message) -> None:
         self.abandoned.append(message)
@@ -286,3 +301,50 @@ async def test_each_queue_holds_back_at_most_one_message():
     assert receiver.fetched == 2
     await listen.aclose()
     assert [m.body for m in receiver.abandoned] == [[b"b"]]
+
+
+@pytest.mark.asyncio
+async def test_a_held_back_message_keeps_its_lock(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.2))
+    receiver = FakeReceiver([b"a", b"b"])
+    broker = make_broker(q=[receiver])
+    listen = broker.listen()
+    await take(listen, 1)
+    await asyncio.sleep(0.5)  # the worker is busy; "b" waits
+    assert receiver.renewed >= 2
+    (second,) = await take(listen, 1)
+    assert second.data == b"b"
+    await listen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_held_back_message_whose_lock_is_lost_is_not_handed_out(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.1))
+    old = FakeReceiver([b"a", b"lost"], renew_error=DROPPED)
+    new = FakeReceiver([b"b"])
+    broker = make_broker(q=[old, new])
+    listen = broker.listen()
+    (first,) = await take(listen, 1)
+    await asyncio.sleep(0.2)
+    (second,) = await take(listen, 1)
+    assert (first.data, second.data) == (b"a", b"b")
+    await first.ack()  # the replaced receiver closes after its last ack
+    assert old.closed
+
+
+@pytest.mark.asyncio
+async def test_lock_renewal_duration_counts_from_hand_out():
+    registered = []
+
+    class FakeRenewer:
+        def register(self, receiver, message, max_lock_renewal_duration):
+            registered.append(max_lock_renewal_duration)
+
+    broker = make_broker(q=[FakeReceiver([b"a", b"b"])])
+    broker._auto_lock_renewer = FakeRenewer()
+    listen = broker.listen()
+    await take(listen, 1)
+    await asyncio.sleep(0.3)
+    await take(listen, 1)
+    assert registered[0] == pytest.approx(300, abs=0.1)
+    assert registered[1] == pytest.approx(300.3, abs=0.1)

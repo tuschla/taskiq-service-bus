@@ -46,4 +46,4 @@ async def other_task():
     ...
 ```
 
-Tasks are sent to the queue named in their `queue` label, or to the first queue. A worker keeps one message ready per queue and, when several queues have a message, hands them out by smooth weighted round-robin: while all queues are backlogged, the example above runs three `high-priority` tasks for each `default` task. A queue without messages never delays the others, and each queue has its own receiver, so a failing queue doesn't affect the others.
+Tasks are sent to the queue named in their `queue` label, or to the first queue. A worker holds back at most one message per queue (renewing its lock) and, when several queues have a message, hands them out by smooth weighted round-robin: while all queues are backlogged, the example above runs about three `high-priority` tasks for each `default` task. The ratio is approximate, because a queue fetches its next message only after the previous one was handed out. `max_lock_renewal_duration` counts from when a task is handed to the worker. A queue without messages never delays the others, and each queue has its own receiver, so a failing queue doesn't affect the others.
