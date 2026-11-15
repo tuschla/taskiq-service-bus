@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from itertools import chain
@@ -22,13 +22,14 @@ logger = logging.getLogger(__name__)
 
 TASK_ID_KEY = "__task_id"
 TASK_NAME_KEY = "__task_name"
+QUEUE_LABEL = "queue"
 
 
 class ServiceBusBroker(AsyncBroker):
     def __init__(  # noqa: PLR0913
         self,
         connection_string: str,
-        queue_name: str,
+        queue_name: str | Mapping[str, int],
         max_lock_renewal_duration: float = 300,
         result_backend: AsyncResultBackend[T] | None = None,
         task_id_generator: Callable[[], str] | None = None,
@@ -40,7 +41,11 @@ class ServiceBusBroker(AsyncBroker):
 
         Args:
             connection_string (str): Azure service bus connection string.
-            queue_name (str): Name of the service bus queue to use.
+            queue_name (str | Mapping[str, int]): Name of the service bus queue to
+                use, or a mapping of queue names to integer weights. With several
+                queues, a worker takes messages from the queues that have messages in
+                proportion to their weights. Tasks are sent to the queue named in
+                their "queue" label, else to the first queue.
             max_lock_renewal_duration (float, optional): Maximum message lock renewal
                 duration in seconds. Defaults to 300.
             result_backend (AsyncResultBackend | None, optional): Result backend to use
@@ -57,14 +62,22 @@ class ServiceBusBroker(AsyncBroker):
         super().__init__(result_backend, task_id_generator)
 
         self._connection_string = connection_string
-        self._queue_name = queue_name
+        weights = {queue_name: 1} if isinstance(queue_name, str) else dict(queue_name)
+        if not weights or any(
+            not isinstance(w, int) or isinstance(w, bool) or w < 1
+            for w in weights.values()
+        ):
+            raise ValueError("Queue weights must be positive integers.")
+        self._weights = weights
+        self._queue_name = next(iter(weights))
         self._max_lock_renewal_duration = max_lock_renewal_duration
         self._reconnect_delay = reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
 
         self._client: ServiceBusClient | None = None
         self._auto_lock_renewer: AutoLockRenewer | None = None
-        self._receiver: ServiceBusReceiver | None = None
+        # The receiver each queue currently reads from.
+        self._receivers: dict[str, ServiceBusReceiver] = {}
         # Messages not yet acknowledged, per receiver, so a replaced receiver is
         # closed only once its last message has been settled.
         self._unacked: dict[ServiceBusReceiver, int] = {}
@@ -93,7 +106,7 @@ class ServiceBusBroker(AsyncBroker):
 
         self._client = None
         self._auto_lock_renewer = None
-        self._receiver = None
+        self._receivers.clear()
         self._unacked.clear()
         self._replaced.clear()
 
@@ -119,9 +132,12 @@ class ServiceBusBroker(AsyncBroker):
         # handle "delay" convention
         # see: https://taskiq-python.github.io/extending-taskiq/broker.html#conventions
         delay = message.labels.get("delay")
+        queue_name = message.labels.get(QUEUE_LABEL, self._queue_name)
+        if queue_name not in self._weights:
+            raise ValueError(f"Queue {queue_name!r} is not one of the broker's queues.")
 
         async with ServiceBusClient.from_connection_string(self._connection_string) as client:
-            async with client.get_queue_sender(self._queue_name) as sender:
+            async with client.get_queue_sender(queue_name) as sender:
 
                 if delay is not None:
                     delay_seconds = float(delay)
@@ -131,24 +147,74 @@ class ServiceBusBroker(AsyncBroker):
                     await sender.send_messages(sb_message)
 
     async def listen(self) -> AsyncGenerator[AckableMessage, None]:
-        """Yield messages retrieved from the queue.
+        """Yield messages retrieved from the queues.
 
-        If the receiver fails or stops (for example after the service closed the
+        Each queue is read by its own receiver, which holds at most one message
+        until it is yielded. When several queues have a message ready, they are
+        yielded by smooth weighted round-robin, so under load each queue gets its
+        share of the messages, and a queue without messages never delays the
+        others.
+
+        If a receiver fails or stops (for example after the service closed the
         connection), it is replaced by a new one after a backoff instead of ending
         the worker's message loop.
 
         Yields:
-            AckableMessage: message received from the queue
+            AckableMessage: message received from one of the queues
         """
         if self._client is None:
             raise RuntimeError("Broker is not initialized. Call startup() first.")
 
+        ready_event = asyncio.Event()
+        ready = {name: asyncio.Queue(maxsize=1) for name in self._weights}
+        current = dict.fromkeys(self._weights, 0)
+        readers = [
+            asyncio.create_task(self._read(name, ready[name], ready_event))
+            for name in self._weights
+        ]
+        try:
+            while True:
+                ready_event.clear()
+                available = [name for name in self._weights if not ready[name].empty()]
+                if not available:
+                    await ready_event.wait()
+                    continue
+                for name in available:
+                    current[name] += self._weights[name]
+                name = max(available, key=current.__getitem__)
+                current[name] -= sum(self._weights[n] for n in available)
+                receiver, message = ready[name].get_nowait()
+                yield AckableMessage(
+                    data=bytes(chain.from_iterable(message.body)),
+                    ack=partial(self._ack, name, receiver, message),
+                )
+        finally:
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+            # Give back messages that were received but never handed to the worker.
+            for queue in ready.values():
+                while not queue.empty():
+                    receiver, message = queue.get_nowait()
+                    try:
+                        await receiver.abandon_message(message)
+                    except Exception:
+                        logger.debug("Abandoning a message failed", exc_info=True)
+
+    async def _read(
+        self,
+        queue_name: str,
+        ready: "asyncio.Queue[tuple[ServiceBusReceiver, ServiceBusReceivedMessage]]",
+        ready_event: asyncio.Event,
+    ) -> None:
+        if self._client is None:
+            raise RuntimeError("Broker is not initialized. Call startup() first.")
         delay = self._reconnect_delay
         while True:
             receiver = self._client.get_queue_receiver(
-                self._queue_name, auto_lock_renewer=self._auto_lock_renewer
+                queue_name, auto_lock_renewer=self._auto_lock_renewer
             )
-            self._receiver = receiver
+            self._receivers[queue_name] = receiver
             self._unacked[receiver] = 0
             try:
                 # Open before iterating, so a failure to connect is retried here and
@@ -157,27 +223,28 @@ class ServiceBusBroker(AsyncBroker):
                 async for message in receiver:
                     delay = self._reconnect_delay
                     self._unacked[receiver] += 1
-                    yield AckableMessage(
-                        data=bytes(chain.from_iterable(message.body)),
-                        ack=partial(self._ack, receiver, message),
-                    )
-                logger.warning("Receiver stopped; reopening in %.1fs", delay)
+                    await ready.put((receiver, message))
+                    ready_event.set()
+                logger.warning("%s: receiver stopped, retry in %ss", queue_name, delay)
             except Exception:
-                logger.exception("Receiver failed; reopening in %.1fs", delay)
+                logger.exception("%s: receiver failed, retry in %ss", queue_name, delay)
             await self._retire(receiver)
             await asyncio.sleep(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
 
     async def _ack(
-        self, receiver: ServiceBusReceiver, message: ServiceBusReceivedMessage
+        self,
+        queue_name: str,
+        receiver: ServiceBusReceiver,
+        message: ServiceBusReceivedMessage,
     ) -> None:
         try:
             try:
                 await receiver.complete_message(message)
             except ValueError:
-                # The receiver was shut down. Another receiver can settle the
-                # message by its lock token, if the lock is still valid.
-                current = self._receiver
+                # The receiver was shut down. Another receiver of the same queue can
+                # settle the message by its lock token, if the lock is still valid.
+                current = self._receivers.get(queue_name)
                 if current is None or current is receiver:
                     raise
                 await current.complete_message(message)

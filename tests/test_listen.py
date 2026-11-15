@@ -1,9 +1,12 @@
 import asyncio
+from collections import Counter
 
 import pytest
 from azure.servicebus.exceptions import ServiceBusConnectionError
+from taskiq import BrokerMessage
 
 from taskiq_service_bus import ServiceBusBroker
+from taskiq_service_bus import broker as broker_module
 
 
 class FakeMessage:
@@ -12,15 +15,17 @@ class FakeMessage:
 
 
 class FakeReceiver:
-    """Yields its messages, then fails with `error` or stops."""
+    """Yields its messages, then fails with `error`, stops, or waits forever."""
 
-    def __init__(self, messages, error=None, open_error=None) -> None:
+    def __init__(self, messages=(), *, error=None, open_error=None, stop=False):
         self.messages = [FakeMessage(m) for m in messages]
         self.error = error
         self.open_error = open_error
+        self.stop = stop
         self.running = False
         self.closed = False
         self.completed = []
+        self.abandoned = []
 
     async def __aenter__(self):
         if self.open_error:
@@ -37,11 +42,16 @@ class FakeReceiver:
         if self.error:
             self.running = False
             raise self.error
+        if not self.stop:
+            await asyncio.Event().wait()
 
     async def complete_message(self, message) -> None:
         if not self.running:
             raise ValueError("handler has already been shutdown")
         self.completed.append(message)
+
+    async def abandon_message(self, message) -> None:
+        self.abandoned.append(message)
 
     async def close(self) -> None:
         self.running = False
@@ -49,24 +59,32 @@ class FakeReceiver:
 
 
 class FakeClient:
+    """Hands out the given receivers per queue, in order."""
+
     def __init__(self, receivers) -> None:
-        self.receivers = list(receivers)
+        self.receivers = {q: list(r) for q, r in receivers.items()}
         self.created = []
 
     def get_queue_receiver(self, queue_name, auto_lock_renewer=None):
-        receiver = self.receivers.pop(0)
+        receiver = self.receivers[queue_name].pop(0)
         self.created.append(receiver)
         return receiver
 
 
-def make_broker(*receivers):
-    broker = ServiceBusBroker("unused", "q", reconnect_delay=0, max_reconnect_delay=0)
+def make_broker(queues="q", **receivers):
+    broker = ServiceBusBroker(
+        "unused", queues, reconnect_delay=0, max_reconnect_delay=0
+    )
     broker._client = FakeClient(receivers)
     return broker
 
 
-async def take(listen, n):
-    return [await anext(listen) for _ in range(n)]
+async def take(listen, n, pause=0.0):
+    messages = []
+    for _ in range(n):
+        await asyncio.sleep(pause)  # let the readers refill, like a busy worker
+        messages.append(await anext(listen))
+    return messages
 
 
 DROPPED = ServiceBusConnectionError(message="connection closed by the service")
@@ -75,9 +93,11 @@ DROPPED = ServiceBusConnectionError(message="connection closed by the service")
 @pytest.mark.asyncio
 async def test_listen_reopens_after_the_receiver_fails_or_stops():
     broker = make_broker(
-        FakeReceiver([b"a"], error=DROPPED),
-        FakeReceiver([b"b"]),  # ends without an error
-        FakeReceiver([b"c"]),
+        q=[
+            FakeReceiver([b"a"], error=DROPPED),
+            FakeReceiver([b"b"], stop=True),
+            FakeReceiver([b"c"]),
+        ]
     )
     messages = await take(broker.listen(), 3)
     assert [m.data for m in messages] == [b"a", b"b", b"c"]
@@ -86,9 +106,11 @@ async def test_listen_reopens_after_the_receiver_fails_or_stops():
 @pytest.mark.asyncio
 async def test_listen_retries_when_opening_the_receiver_fails():
     broker = make_broker(
-        FakeReceiver([], open_error=DROPPED),
-        FakeReceiver([], open_error=DROPPED),
-        FakeReceiver([b"a"]),
+        q=[
+            FakeReceiver(open_error=DROPPED),
+            FakeReceiver(open_error=DROPPED),
+            FakeReceiver([b"a"]),
+        ]
     )
     (message,) = await take(broker.listen(), 1)
     assert message.data == b"a"
@@ -99,9 +121,8 @@ async def test_listen_retries_when_opening_the_receiver_fails():
 async def test_ack_after_the_receiver_was_replaced_settles_on_the_new_one():
     old = FakeReceiver([b"a"], error=DROPPED)
     new = FakeReceiver([b"b"])
-    broker = make_broker(old, new)
-    listen = broker.listen()
-    first, second = await take(listen, 2)
+    broker = make_broker(q=[old, new])
+    first, second = await take(broker.listen(), 2)
 
     assert not old.closed  # still has an unacknowledged message
     await first.ack()
@@ -114,7 +135,7 @@ async def test_ack_after_the_receiver_was_replaced_settles_on_the_new_one():
 @pytest.mark.asyncio
 async def test_ack_on_a_live_receiver_settles_there():
     receiver = FakeReceiver([b"a"])
-    broker = make_broker(receiver)
+    broker = make_broker(q=[receiver])
     (message,) = await take(broker.listen(), 1)
     await message.ack()
     assert [m.body for m in receiver.completed] == [[b"a"]]
@@ -130,13 +151,123 @@ async def test_listen_raises_before_startup():
 
 def test_reconnect_delay_backs_off(monkeypatch):
     delays = []
+    real_sleep = asyncio.sleep
 
     async def fake_sleep(delay):
-        delays.append(delay)
+        if delay:
+            delays.append(delay)
+        await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     broker = ServiceBusBroker("unused", "q", reconnect_delay=1, max_reconnect_delay=4)
-    failing = [FakeReceiver([], open_error=DROPPED) for _ in range(4)]
-    broker._client = FakeClient([*failing, FakeReceiver([b"a"])])
+    failing = [FakeReceiver(open_error=DROPPED) for _ in range(4)]
+    broker._client = FakeClient({"q": [*failing, FakeReceiver([b"a"])]})
     asyncio.run(take(broker.listen(), 1))
     assert delays == [1, 2, 4, 4]
+
+
+@pytest.mark.asyncio
+async def test_backlogged_queues_share_messages_by_weight():
+    broker = make_broker(
+        {"high": 3, "low": 1},
+        high=[FakeReceiver([b"h"] * 50)],
+        low=[FakeReceiver([b"l"] * 50)],
+    )
+    messages = await take(broker.listen(), 40, pause=0.001)
+    assert Counter(m.data for m in messages) == {b"h": 30, b"l": 10}
+
+
+@pytest.mark.asyncio
+async def test_an_empty_queue_does_not_hold_up_the_others():
+    broker = make_broker(
+        {"busy": 1, "empty": 10},
+        busy=[FakeReceiver([b"a", b"b", b"c"])],
+        empty=[FakeReceiver()],
+    )
+    messages = await asyncio.wait_for(take(broker.listen(), 3), timeout=1)
+    assert [m.data for m in messages] == [b"a", b"b", b"c"]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_queue_does_not_hold_up_the_others():
+    broker = make_broker(
+        {"down": 1, "up": 1},
+        down=[FakeReceiver(open_error=DROPPED) for _ in range(100)],
+        up=[FakeReceiver([b"a", b"b"])],
+    )
+    messages = await asyncio.wait_for(take(broker.listen(), 2), timeout=1)
+    assert [m.data for m in messages] == [b"a", b"b"]
+
+
+@pytest.mark.asyncio
+async def test_closing_the_listener_abandons_messages_not_handed_out():
+    receiver_a = FakeReceiver([b"a1", b"a2"])
+    receiver_b = FakeReceiver([b"b1"])
+    broker = make_broker({"a": 1, "b": 1}, a=[receiver_a], b=[receiver_b])
+    listen = broker.listen()
+    (first,) = await take(listen, 1, pause=0.01)
+    await asyncio.sleep(0.01)
+    await listen.aclose()
+    # Each queue holds back one message; a2 replaced a1 once a1 was handed out.
+    assert first.data == b"a1"
+    abandoned = {m.body[0] for r in (receiver_a, receiver_b) for m in r.abandoned}
+    assert abandoned == {b"a2", b"b1"}
+
+
+@pytest.mark.parametrize("weights", [{}, {"q": 0}, {"q": 1.5}, {"q": True}])
+def test_invalid_weights_are_rejected(weights):
+    with pytest.raises(ValueError, match="weights"):
+        ServiceBusBroker("unused", weights)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected"), [({}, "first"), ({"queue": "second"}, "second")]
+)
+async def test_kick_sends_to_the_queue_label_or_the_first_queue(
+    monkeypatch, labels, expected
+):
+    sent_to = []
+
+    class FakeSender:
+        def __init__(self, queue_name):
+            self.queue_name = queue_name
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def send_messages(self, message):
+            sent_to.append(self.queue_name)
+
+    class FakeSendClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        def get_queue_sender(self, queue_name):
+            return FakeSender(queue_name)
+
+    monkeypatch.setattr(
+        broker_module.ServiceBusClient,
+        "from_connection_string",
+        staticmethod(lambda *a, **k: FakeSendClient()),
+    )
+    broker = ServiceBusBroker("unused", {"first": 1, "second": 2})
+    message = BrokerMessage(task_id="t", task_name="n", message=b"x", labels=labels)
+    await broker.kick(message)
+    assert sent_to == [expected]
+
+
+@pytest.mark.asyncio
+async def test_kick_rejects_an_unknown_queue_label():
+    broker = ServiceBusBroker("unused", {"first": 1})
+    message = BrokerMessage(
+        task_id="t", task_name="n", message=b"x", labels={"queue": "other"}
+    )
+    with pytest.raises(ValueError, match="other"):
+        await broker.kick(message)
