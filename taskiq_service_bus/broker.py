@@ -8,11 +8,11 @@ from typing import TypeVar
 
 from azure.servicebus import ServiceBusMessage, ServiceBusReceivedMessage
 from azure.servicebus.aio import (
-    AutoLockRenewer,
     ServiceBusClient,
     ServiceBusReceiver,
     ServiceBusSender,
 )
+from azure.servicebus.exceptions import MessageLockLostError
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 T = TypeVar("T")
@@ -23,10 +23,28 @@ logger = logging.getLogger(__name__)
 TASK_ID_KEY = "__task_id"
 TASK_NAME_KEY = "__task_name"
 QUEUE_LABEL = "queue"
-# Renew the lock of a held back message this long before it expires.
-HOLD_RENEW_MARGIN = timedelta(seconds=10)
+# Renew a message lock this long before it expires (at most half the lock duration).
+RENEW_MARGIN = timedelta(seconds=10)
+# Wait this long between attempts when renewing a lock fails.
+RENEW_RETRY_DELAY = 1.0
 
-_Ready = tuple[ServiceBusReceiver, ServiceBusReceivedMessage, datetime]
+# A received message, its receiver, and how long before expiry to renew its lock.
+_Ready = tuple[ServiceBusReceiver, ServiceBusReceivedMessage, timedelta]
+
+
+def _locked_until(message: ServiceBusReceivedMessage) -> datetime:
+    if message.locked_until_utc is None:
+        raise ValueError("Expected a message received in PEEK_LOCK mode.")
+    return message.locked_until_utc
+
+
+def _seconds_until(moment: datetime) -> float:
+    return max((moment - datetime.now(UTC)).total_seconds(), 0)
+
+
+def _renew_margin(message: ServiceBusReceivedMessage) -> timedelta:
+    """Margin for a just received message, adapted to short lock durations."""
+    return min(RENEW_MARGIN, (_locked_until(message) - datetime.now(UTC)) / 2)
 
 
 class ServiceBusBroker(AsyncBroker):
@@ -79,7 +97,8 @@ class ServiceBusBroker(AsyncBroker):
         self._max_reconnect_delay = max_reconnect_delay
 
         self._client: ServiceBusClient | None = None
-        self._auto_lock_renewer: AutoLockRenewer | None = None
+        # Lock renewal of messages handed to the worker, until they are acknowledged.
+        self._renewals: set[asyncio.Task[None]] = set()
         # The receiver each queue currently reads from.
         self._receivers: dict[str, ServiceBusReceiver] = {}
         # Messages not yet acknowledged, per receiver, so a replaced receiver is
@@ -91,10 +110,6 @@ class ServiceBusBroker(AsyncBroker):
         """Do something when starting broker."""
         await super().startup()
         self._client = ServiceBusClient.from_connection_string(self._connection_string)
-        if self.is_worker_process:
-            self._auto_lock_renewer = AutoLockRenewer(
-                max_lock_renewal_duration=self._max_lock_renewal_duration
-            )
 
 
     async def shutdown(self) -> None:
@@ -103,13 +118,14 @@ class ServiceBusBroker(AsyncBroker):
         This method is called when the broker is closing.
         """
         await super().shutdown()
+        for renewal in self._renewals:
+            renewal.cancel()
         if self._client is not None:
 
             # This closes senders and receivers as well
             await self._client.close()
 
         self._client = None
-        self._auto_lock_renewer = None
         self._receivers.clear()
         self._unacked.clear()
         self._replaced.clear()
@@ -154,11 +170,15 @@ class ServiceBusBroker(AsyncBroker):
         """Yield messages retrieved from the queues.
 
         Each queue is read by its own receiver, which holds at most one message
-        (renewing its lock) until it is yielded. When several queues have a message
-        ready, they are yielded by smooth weighted round-robin, so under load each
-        queue gets its share of the messages, and a queue without messages never
-        delays the others. The lock renewer takes over a message when it is
-        yielded, so `max_lock_renewal_duration` counts from then.
+        until it is yielded. When several queues have a message ready, they are
+        yielded by smooth weighted round-robin, so under load each queue gets its
+        share of the messages, and a queue without messages never delays the
+        others.
+
+        Message locks are renewed while a message is held, and after it is yielded
+        until it is acknowledged or `max_lock_renewal_duration` has passed. Renewal
+        is retried while the receiver reconnects, and falls back to the queue's
+        current receiver if the message's receiver was replaced.
 
         If a receiver fails or stops (for example after the service closed the
         connection), it is replaced by a new one after a backoff instead of ending
@@ -188,19 +208,19 @@ class ServiceBusBroker(AsyncBroker):
                     current[name] += self._weights[name]
                 name = max(available, key=current.__getitem__)
                 current[name] -= sum(self._weights[n] for n in available)
-                receiver, message, received_at = ready[name].get_nowait()
+                receiver, message, margin = ready[name].get_nowait()
                 ready[name].task_done()  # lets that queue's reader fetch the next one
-                if self._auto_lock_renewer is not None:
-                    # The renewer counts the duration from when the message was
-                    # received; add the time it was held back.
-                    held = (datetime.now(UTC) - received_at).total_seconds()
-                    duration = self._max_lock_renewal_duration + held
-                    self._auto_lock_renewer.register(
-                        receiver, message, max_lock_renewal_duration=duration
-                    )
+                until = datetime.now(UTC) + timedelta(
+                    seconds=self._max_lock_renewal_duration
+                )
+                renewal = asyncio.create_task(
+                    self._keep_locked(name, receiver, message, margin, until)
+                )
+                self._renewals.add(renewal)
+                renewal.add_done_callback(self._renewals.discard)
                 yield AckableMessage(
                     data=bytes(chain.from_iterable(message.body)),
-                    ack=partial(self._ack, name, receiver, message),
+                    ack=partial(self._ack, name, receiver, message, renewal),
                 )
         finally:
             for reader in readers:
@@ -235,11 +255,12 @@ class ServiceBusBroker(AsyncBroker):
                 async for message in receiver:
                     delay = self._reconnect_delay
                     self._unacked[receiver] += 1
-                    ready.put_nowait((receiver, message, datetime.now(UTC)))
+                    margin = _renew_margin(message)
+                    ready.put_nowait((receiver, message, margin))
                     ready_event.set()
                     # Fetch the next message only once this one was handed out, so a
                     # queue never holds more than one message back.
-                    await self._hold(receiver, message, ready)
+                    await self._hold(queue_name, receiver, message, margin, ready)
                 logger.warning("%s: receiver stopped, retry in %ss", queue_name, delay)
             except Exception:
                 logger.exception("%s: receiver failed, retry in %ss", queue_name, delay)
@@ -249,41 +270,80 @@ class ServiceBusBroker(AsyncBroker):
 
     async def _hold(
         self,
+        queue_name: str,
         receiver: ServiceBusReceiver,
         message: ServiceBusReceivedMessage,
+        margin: timedelta,
         ready: "asyncio.Queue[_Ready]",
     ) -> None:
         """Wait until the message is handed out, renewing its lock meanwhile."""
-        if message.locked_until_utc is None:
-            raise RuntimeError("Expected a locked message (PEEK_LOCK receive mode).")
-        lock_duration = message.locked_until_utc - datetime.now(UTC)
-        margin = min(HOLD_RENEW_MARGIN, lock_duration / 2)
         while True:
-            locked_until = message.locked_until_utc
-            timeout = (locked_until - margin - datetime.now(UTC)).total_seconds()
+            timeout = _seconds_until(_locked_until(message) - margin)
             try:
-                await asyncio.wait_for(ready.join(), timeout=max(timeout, 0))
+                await asyncio.wait_for(ready.join(), timeout=timeout)
                 return
             except asyncio.TimeoutError:
                 if ready.empty():
                     return  # handed out as the timeout fired
-            try:
-                await receiver.renew_message_lock(message)
-            except Exception:
-                if ready.empty():
-                    return  # handed out meanwhile; the lock renewer has it now
-                # Take the message back; it is delivered again once its lock expires.
+            renewed = await self._renew(queue_name, receiver, message)
+            if not renewed and not ready.empty():
+                # Don't hand out a message whose lock is lost; it is delivered again.
                 ready.get_nowait()
                 ready.task_done()
                 self._unacked[receiver] -= 1
-                raise
+                return
+
+    async def _keep_locked(
+        self,
+        queue_name: str,
+        receiver: ServiceBusReceiver,
+        message: ServiceBusReceivedMessage,
+        margin: timedelta,
+        until: datetime,
+    ) -> None:
+        """Renew the message lock until `until`; cancelled when acknowledged."""
+        while _locked_until(message) < until:
+            await asyncio.sleep(_seconds_until(_locked_until(message) - margin))
+            if not await self._renew(queue_name, receiver, message):
+                logger.warning("%s: lost the lock of message %s", queue_name, message)
+                return
+
+    async def _renew(
+        self,
+        queue_name: str,
+        receiver: ServiceBusReceiver,
+        message: ServiceBusReceivedMessage,
+    ) -> bool:
+        """Renew the message lock, retrying until it expires. False if it is lost."""
+        while True:
+            try:
+                try:
+                    await receiver.renew_message_lock(message)
+                except ValueError:
+                    # The receiver is shut down or reconnecting. Another receiver
+                    # of the same queue can renew the lock by its token.
+                    current = self._receivers.get(queue_name)
+                    if current is None or current is receiver:
+                        raise
+                    await current.renew_message_lock(message)
+            except MessageLockLostError:
+                return False
+            except Exception:
+                if _seconds_until(_locked_until(message)) == 0:
+                    return False
+                logger.debug("%s: renewal failed, retrying", queue_name, exc_info=True)
+                await asyncio.sleep(RENEW_RETRY_DELAY)
+            else:
+                return True
 
     async def _ack(
         self,
         queue_name: str,
         receiver: ServiceBusReceiver,
         message: ServiceBusReceivedMessage,
+        renewal: "asyncio.Task[None]",
     ) -> None:
+        renewal.cancel()
         try:
             try:
                 await receiver.complete_message(message)

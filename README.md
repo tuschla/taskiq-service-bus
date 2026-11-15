@@ -22,7 +22,7 @@ def example_task():
 
 - `connection_string` - Service Bus Namespace connection string. Instructions on how to find it can be found here: [Get the connection string](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-python-how-to-use-queues?tabs=connection-string#get-the-connection-string)
 - `queue_name` - Name of the Service Bus queue to use, or a mapping of queue names to integer weights (see below)
-- `max_lock_renewal_duration` - Maximum message lock renewal duration in seconds. Optional, defaults to 300.
+- `max_lock_renewal_duration` - How long, in seconds, the worker keeps renewing the lock of a message after starting its task. Optional, defaults to 300. The broker renews locks itself instead of using the SDK's `AutoLockRenewer`, and keeps retrying while a receiver reconnects.
 - `result_backend` - Result backend to use. Optional.
 - `task_id_generator` - custom task ID generator function. Optional, if not provided, taskiq will use `uuid4`.
 - `reconnect_delay` - Seconds to wait before reopening the receiver after it failed, stopped, or could not connect; doubles on each consecutive failure. Optional, defaults to 1.
@@ -46,4 +46,4 @@ async def other_task():
     ...
 ```
 
-Tasks are sent to the queue named in their `queue` label, or to the first queue. A worker holds back at most one message per queue (renewing its lock) and, when several queues have a message, hands them out by smooth weighted round-robin: while all queues are backlogged, the example above runs about three `high-priority` tasks for each `default` task. The ratio is approximate, because a queue fetches its next message only after the previous one was handed out. `max_lock_renewal_duration` counts from when a task is handed to the worker. A queue without messages never delays the others, and each queue has its own receiver, so a failing queue doesn't affect the others.
+Tasks are sent to the queue named in their `queue` label, or to the first queue. A worker holds back at most one message per queue (renewing its lock) and, when several queues have a message, hands them out by smooth weighted round-robin: while all queues are backlogged, the example above runs about three `high-priority` tasks for each `default` task. The ratio is approximate, because a queue fetches its next message only after the previous one was handed out. A queue without messages never delays the others, and each queue has its own receiver, so a failing queue doesn't affect the others.

@@ -4,7 +4,7 @@ from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from azure.servicebus.exceptions import ServiceBusConnectionError
+from azure.servicebus.exceptions import MessageLockLostError, ServiceBusConnectionError
 from taskiq import BrokerMessage
 
 from taskiq_service_bus import ServiceBusBroker
@@ -23,7 +23,7 @@ class FakeReceiver:
     """Yields its messages, then fails with `error`, stops, or waits forever."""
 
     def __init__(
-        self, messages=(), *, error=None, open_error=None, stop=False, renew_error=None
+        self, messages=(), *, error=None, open_error=None, stop=False, lost=()
     ):
         self.messages = [FakeMessage(m) for m in messages]
         self.error = error
@@ -35,7 +35,7 @@ class FakeReceiver:
         self.abandoned = []
         self.fetched = 0
         self.renewed = 0
-        self.renew_error = renew_error
+        self.lost = lost
 
     async def __aenter__(self):
         if self.open_error:
@@ -62,8 +62,10 @@ class FakeReceiver:
         self.completed.append(message)
 
     async def renew_message_lock(self, message) -> None:
-        if self.renew_error:
-            raise self.renew_error
+        if not self.running:
+            raise ValueError("handler has already been shutdown")
+        if message.body[0] in self.lost:
+            raise MessageLockLostError(message="lock lost")
         self.renewed += 1
         message.locked_until_utc = datetime.now(UTC) + LOCK
 
@@ -180,7 +182,7 @@ def test_reconnect_delay_backs_off(monkeypatch):
     failing = [FakeReceiver(open_error=DROPPED) for _ in range(4)]
     broker._client = FakeClient({"q": [*failing, FakeReceiver([b"a"])]})
     asyncio.run(take(broker.listen(), 1))
-    assert delays == [1, 2, 4, 4]
+    assert delays[:4] == [1, 2, 4, 4]  # then the lock renewal of "a"
 
 
 @pytest.mark.asyncio
@@ -320,31 +322,69 @@ async def test_a_held_back_message_keeps_its_lock(monkeypatch):
 @pytest.mark.asyncio
 async def test_a_held_back_message_whose_lock_is_lost_is_not_handed_out(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.1))
-    old = FakeReceiver([b"a", b"lost"], renew_error=DROPPED)
-    new = FakeReceiver([b"b"])
-    broker = make_broker(q=[old, new])
+    receiver = FakeReceiver([b"a", b"lost", b"b"], lost={b"lost"})
+    broker = make_broker(q=[receiver])
     listen = broker.listen()
     (first,) = await take(listen, 1)
     await asyncio.sleep(0.2)
     (second,) = await take(listen, 1)
     assert (first.data, second.data) == (b"a", b"b")
-    await first.ack()  # the replaced receiver closes after its last ack
-    assert old.closed
+    await listen.aclose()
 
 
 @pytest.mark.asyncio
-async def test_lock_renewal_duration_counts_from_hand_out():
-    registered = []
+async def test_a_handed_out_message_stays_locked_until_acknowledged(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.2))
+    receiver = FakeReceiver([b"a"])
+    broker = make_broker(q=[receiver])
+    (message,) = await take(broker.listen(), 1)
+    await asyncio.sleep(0.5)
+    renewed = receiver.renewed
+    assert renewed >= 2
+    await message.ack()
+    await asyncio.sleep(0.3)
+    assert receiver.renewed == renewed
+    assert not broker._renewals
 
-    class FakeRenewer:
-        def register(self, receiver, message, max_lock_renewal_duration):
-            registered.append(max_lock_renewal_duration)
 
-    broker = make_broker(q=[FakeReceiver([b"a", b"b"])])
-    broker._auto_lock_renewer = FakeRenewer()
+@pytest.mark.asyncio
+async def test_renewal_stops_after_max_lock_renewal_duration(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.2))
+    receiver = FakeReceiver([b"a"])
+    broker = make_broker(q=[receiver])
+    broker._max_lock_renewal_duration = 0.3
+    await take(broker.listen(), 1)
+    await asyncio.sleep(0.8)
+    assert 1 <= receiver.renewed <= 3
+    assert not broker._renewals
+
+
+@pytest.mark.asyncio
+async def test_renewal_retries_while_the_receiver_reconnects(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.4))
+    monkeypatch.setattr(broker_module, "RENEW_RETRY_DELAY", 0.01)
+    receiver = FakeReceiver([b"a"])
+    broker = make_broker(q=[receiver])
+    (message,) = await take(broker.listen(), 1)
+    receiver.running = False  # the SDK reconnecting: renewals raise ValueError
+    await asyncio.sleep(0.25)
+    assert receiver.renewed == 0
+    receiver.running = True
+    await asyncio.sleep(0.1)
+    assert receiver.renewed == 1
+    await message.ack()
+    assert [m.body for m in receiver.completed] == [[b"a"]]
+
+
+@pytest.mark.asyncio
+async def test_renewal_uses_the_current_receiver_after_a_replacement(monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "LOCK", timedelta(seconds=0.2))
+    old = FakeReceiver([b"a"], error=DROPPED)
+    new = FakeReceiver()
+    broker = make_broker(q=[old, new])
     listen = broker.listen()
     await take(listen, 1)
-    await asyncio.sleep(0.3)
-    await take(listen, 1)
-    assert registered[0] == pytest.approx(300, abs=0.1)
-    assert registered[1] == pytest.approx(300.3, abs=0.1)
+    await asyncio.sleep(0.5)
+    assert old.renewed == 0
+    assert new.renewed >= 2
+    await listen.aclose()
