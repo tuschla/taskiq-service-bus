@@ -121,8 +121,10 @@ class ServiceBusBroker(AsyncBroker):
         This method is called when the broker is closing.
         """
         await super().shutdown()
-        for renewal in self._renewals:
+        renewals = list(self._renewals)
+        for renewal in renewals:
             renewal.cancel()
+        await asyncio.gather(*renewals, return_exceptions=True)
         if self._client is not None:
 
             # This closes senders and receivers as well
